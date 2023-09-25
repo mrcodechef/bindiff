@@ -27,6 +27,7 @@
 #include "third_party/absl/strings/str_cat.h"
 #include "third_party/absl/strings/str_format.h"
 #include "third_party/absl/strings/str_split.h"
+#include "third_party/absl/strings/string_view.h"
 #include "third_party/zynamics/bindiff/config.h"
 #include "third_party/zynamics/bindiff/version.h"
 #include "third_party/zynamics/binexport/util/filesystem.h"
@@ -45,6 +46,60 @@ namespace security::bindiff {
 
 using ::security::binexport::GetLastOsError;
 using ::security::binexport::GetOrCreateAppDataDirectory;
+
+// File extension for shared libraries on supported platforms.
+#if defined(_WIN32)
+constexpr absl::string_view kLibrarySuffix = ".dll";
+#elif defined(__APPLE__)
+constexpr absl::string_view kLibrarySuffix = ".dylib";
+#else
+constexpr absl::string_view kLibrarySuffix = ".so";
+#endif
+
+absl::Status CreateOrUpdateDirectoryLink(const std::string& target,
+                                         const std::string& link_path) {
+#ifndef _WIN32
+  // On Linux and macOS, simply create a symlink.
+  return CreateOrUpdateLinkWithFallback(target, link_path);
+#else
+  // TODO(cblichmann): On Windows, we can do better than trying to create a
+  //                   symlink by using directory junctions, which can be
+  //                   created by regular users:
+  // - CreateDirectories()
+  // - OpenDirectory()
+  // - Prepare a REPARSE_MOUNTPOINT_DATA_BUFFER
+  // - DeviceIoControl(dir_handle, FSCTL_SET_REPARSE_POINT, ...)
+  std::string canonical_target(MAX_PATH, '\0');
+  if (!PathCanonicalize(&canonical_target[0], target.c_str()) ||
+      !PathFileExists(canonical_target.c_str())) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Cannot read '", target, "': ", GetLastOsError()));
+  }
+  canonical_target.resize(strlen(canonical_target.c_str()));  // Right-trim NULs
+
+  std::string canonical_path(MAX_PATH, '\0');
+  if (!PathCanonicalize(&canonical_path[0], link_path.c_str())) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Path '", link_path, "' invalid: ", GetLastOsError()));
+  }
+  canonical_path.resize(strlen(canonical_path.c_str()));
+
+  // Remove existing file first
+  if (PathFileExists(canonical_path.c_str()) &&
+      !DeleteFile(canonical_path.c_str())) {
+    return absl::UnknownError(absl::StrCat(
+        "Cannot remove existing '", canonical_path, "': ", GetLastOsError()));
+  }
+  if (CreateSymbolicLink(canonical_path.c_str(), canonical_target.c_str(),
+                         SYMBOLIC_LINK_FLAG_DIRECTORY |
+                             SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+    return absl::OkStatus();
+  }
+  return absl::UnknownError(absl::StrCat("Symlink '", canonical_target,
+                                         "' to '", canonical_path,
+                                         "' failed: ", GetLastOsError()));
+#endif
+}
 
 absl::StatusOr<std::string> GetOrCreateIdaProUserPluginsDirectory() {
   std::string idapro_app_data;
@@ -71,70 +126,98 @@ absl::StatusOr<std::string> GetOrCreateIdaProUserPluginsDirectory() {
   return idapro_app_data_plugin_path;
 }
 
-// Sets up per-user configuration, creating links to the disassembler plugins.
-// On Linux and macOS, always creates symlinks. On Windows, tries to create
-// symlinks first, falling back to hardlinks and copying the files as a last
-// resort.
-absl::Status PerUserSetup(const Config& config) {
-  const std::string& bindiff_dir = config.directory();
-  if (bindiff_dir.empty()) {
-    return absl::FailedPreconditionError(
-        "Path to BinDiff missing from config file");
-  }
-
+// Returns the path to Ghidra's per-user extension directory. Ghidra setings are
+// stored in versioned directories, so the version argument should be of the
+// form "10.2.2_PUBLIC".
+absl::StatusOr<std::string> GetOrCreateGhidraUserExtensionsDirectory(
+    absl::string_view version) {
+  std::string ghidra_app_data;
 #if defined(_WIN32)
-  constexpr absl::string_view kLibrarySuffix = ".dll";
+  // On Windows, Ghidra stores its settings directory in the user profile folder
+  // under ".ghidra" instead of "AppData/ghidra". This behavior is discouraged
+  // and may eventually change.
+  constexpr absl::string_view kGhidra = ".ghidra";
 
+  char buffer[MAX_PATH] = {0};
+  if (SHGetFolderPath(/*hwndOwner=*/0, CSIDL_PROFILE, /*hToken=*/0,
+                      /*dwFlags=*/0, buffer) != S_OK) {
+    return absl::UnknownError(GetLastOsError());
+  }
+  ghidra_app_data = JoinPath(buffer, kGhidra);
+#elif defined(__APPLE__)
+  // On macOS, Ghidra stores its settings directly in the user's home folder
+  // under ".ghidra" instead of "Library/Application Support/ghidra", which
+  // is what GetOrCreateAppDataDirectory() would produce.
+  constexpr absl::string_view kGhidra = ".ghidra";
+  const char* home_dir = getenv("HOME");
+  if (!home_dir) {
+    return absl::NotFoundError("Home directory not set");
+  }
+  ghidra_app_data = JoinPath(home_dir, kGhidra);
+#else
+  constexpr absl::string_view kGhidra = "ghidra";
+  NA_ASSIGN_OR_RETURN(ghidra_app_data, GetOrCreateAppDataDirectory(kGhidra));
+#endif
+
+  std::string ghidra_app_data_extension_path = JoinPath(
+      ghidra_app_data, absl::StrCat(".ghidra_", version), "Extensions");
+  NA_RETURN_IF_ERROR(CreateDirectories(ghidra_app_data_extension_path));
+  return ghidra_app_data_extension_path;
+}
+
+absl::Status MaybeSetupBinaryNinjaPerUser(absl::string_view bindiff_dir) {
+#if defined(_WIN32)
   constexpr absl::string_view kBinaryNinja = "Binary Ninja";
   constexpr absl::string_view kBinDiffBinaryNinjaPluginsPrefix =
       R"(Plugins\Binary Ninja)";
-
-  constexpr absl::string_view kBinDiffIdaProPluginsPrefix =
-      R"(Plugins\IDA Pro)";
 #elif defined(__APPLE__)
-  constexpr absl::string_view kLibrarySuffix = ".dylib";
-
   constexpr absl::string_view kBinaryNinja = "Binary Ninja";
   constexpr absl::string_view kBinDiffBinaryNinjaPluginsPrefix =
       "../../../Plugins/Binary Ninja";  // Relative to .app bundle
-
-  constexpr absl::string_view kBinDiffIdaProPluginsPrefix =
-      "../../../Plugins/IDA Pro";  // Relative to .app bundle
 #else
-  constexpr absl::string_view kLibrarySuffix = ".so";
-
   constexpr absl::string_view kBinaryNinja = "binaryninja";
   constexpr absl::string_view kBinDiffBinaryNinjaPluginsPrefix =
       "plugins/binaryninja";
-
-  constexpr absl::string_view kBinDiffIdaProPluginsPrefix = "plugins/idapro";
 #endif
 
-  // Binary Ninja
+  const std::string bindiff_binaryninja_plugins =
+      JoinPath(bindiff_dir, kBinDiffBinaryNinjaPluginsPrefix);
+  if (!IsDirectory(bindiff_binaryninja_plugins)) {
+    // Binary Ninja may not have been selected during install.
+    return absl::OkStatus();
+  }
+
   NA_ASSIGN_OR_RETURN(const std::string binaryninja_app_data,
                       GetOrCreateAppDataDirectory(kBinaryNinja));
   const std::string binaryninja_app_data_plugin_path =
       JoinPath(binaryninja_app_data, "plugins");
   NA_RETURN_IF_ERROR(CreateDirectories(binaryninja_app_data_plugin_path));
 
-  std::string plugin_basename = absl::StrFormat(
+  // BinExport only
+  const std::string plugin_basename = absl::StrFormat(
       "binexport%s_binaryninja%s", kBinDiffBinExportRelease, kLibrarySuffix);
-  if (auto status = CreateOrUpdateLinkWithFallback(
-          JoinPath(bindiff_dir, kBinDiffBinaryNinjaPluginsPrefix,
-                   plugin_basename),
-          JoinPath(binaryninja_app_data_plugin_path, plugin_basename));
-      // Binary Ninja may not have been selected during install, so skip if not
-      // found
-      !status.ok() && !absl::IsNotFound(status)) {
-    return status;
-  }
+  return CreateOrUpdateLinkWithFallback(
+      JoinPath(bindiff_binaryninja_plugins, plugin_basename),
+      JoinPath(binaryninja_app_data_plugin_path, plugin_basename));
+}
 
-  // IDA Pro
+absl::Status SetupIdaProPerUser(absl::string_view bindiff_dir) {
+#if defined(_WIN32)
+  constexpr absl::string_view kBinDiffIdaProPluginsPrefix =
+      R"(Plugins\IDA Pro)";
+#elif defined(__APPLE__)
+  constexpr absl::string_view kBinDiffIdaProPluginsPrefix =
+      "../../../Plugins/IDA Pro";  // Relative to .app bundle
+#else
+  constexpr absl::string_view kBinDiffIdaProPluginsPrefix = "plugins/idapro";
+#endif
+
   NA_ASSIGN_OR_RETURN(const std::string idapro_app_data_plugin_path,
                       GetOrCreateIdaProUserPluginsDirectory());
   NA_RETURN_IF_ERROR(CreateDirectories(idapro_app_data_plugin_path));
 
-  plugin_basename =
+  // BinDiff itself
+  std::string plugin_basename =
       absl::StrFormat("bindiff%s_ida%s", kBinDiffRelease, kLibrarySuffix);
   NA_RETURN_IF_ERROR(CreateOrUpdateLinkWithFallback(
       JoinPath(bindiff_dir, kBinDiffIdaProPluginsPrefix, plugin_basename),
@@ -145,6 +228,7 @@ absl::Status PerUserSetup(const Config& config) {
       JoinPath(bindiff_dir, kBinDiffIdaProPluginsPrefix, plugin_basename),
       JoinPath(idapro_app_data_plugin_path, plugin_basename)));
 
+  // BinExport
   plugin_basename = absl::StrFormat("binexport%s_ida%s",
                                     kBinDiffBinExportRelease, kLibrarySuffix);
   NA_RETURN_IF_ERROR(CreateOrUpdateLinkWithFallback(
@@ -155,7 +239,52 @@ absl::Status PerUserSetup(const Config& config) {
   NA_RETURN_IF_ERROR(CreateOrUpdateLinkWithFallback(
       JoinPath(bindiff_dir, kBinDiffIdaProPluginsPrefix, plugin_basename),
       JoinPath(idapro_app_data_plugin_path, plugin_basename)));
+  return absl::OkStatus();
+}
 
+absl::Status MaybeSetupGhidraPerUser(absl::string_view bindiff_dir) {
+#if defined(_WIN32)
+  constexpr absl::string_view kBinDiffGhidraExtensionPrefix = R"(Extra\Ghidra)";
+#elif defined(__APPLE__)
+  constexpr absl::string_view kBinDiffGhidraExtensionPrefix =
+      "../../../Extra/Ghidra";  // Relative to .app bundle
+#else
+  constexpr absl::string_view kBinDiffGhidraExtensionPrefix = "extra/ghidra";
+#endif
+
+  const std::string bindiff_ghidra_extensions =
+      JoinPath(bindiff_dir, kBinDiffGhidraExtensionPrefix);
+  if (!IsDirectory(bindiff_ghidra_extensions)) {
+    // Ghidra may not have been selected during install.
+    return absl::OkStatus();
+  }
+
+  for (absl::string_view version : {
+           "10.3_PUBLIC",
+       }) {
+    NA_ASSIGN_OR_RETURN(const std::string ghidra_app_data_extensions_dir,
+                        GetOrCreateGhidraUserExtensionsDirectory(version));
+    NA_RETURN_IF_ERROR(CreateOrUpdateDirectoryLink(
+        JoinPath(bindiff_dir, kBinDiffGhidraExtensionPrefix, "BinExport"),
+        JoinPath(ghidra_app_data_extensions_dir, "BinExport")));
+  }
+  return absl::OkStatus();
+}
+
+// Sets up per-user configuration, creating links to the disassembler plugins.
+// On Linux and macOS, always creates symlinks. On Windows, tries to create
+// symlinks first, falling back to hardlinks/directory junctions and copying the
+// files as a last resort.
+absl::Status PerUserSetup(const Config& config) {
+  const std::string& bindiff_dir = config.directory();
+  if (bindiff_dir.empty()) {
+    return absl::FailedPreconditionError(
+        "Path to BinDiff missing from config file");
+  }
+
+  NA_RETURN_IF_ERROR(SetupIdaProPerUser(bindiff_dir));  // Always installed
+  NA_RETURN_IF_ERROR(MaybeSetupBinaryNinjaPerUser(bindiff_dir));
+  NA_RETURN_IF_ERROR(MaybeSetupGhidraPerUser(bindiff_dir));
   return absl::OkStatus();
 }
 
